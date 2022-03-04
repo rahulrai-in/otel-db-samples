@@ -7,7 +7,7 @@ using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
 
-var lsToken = builder.Configuration.GetValue<string>("LSToken");
+var lsToken = builder.Configuration.GetValue<string>("LsToken");
 
 builder.Services.AddScoped(_ =>
     new SqlConnection(builder.Configuration.GetConnectionString("EmployeeDbConnectionString")));
@@ -54,7 +54,7 @@ builder.Services.AddOpenTelemetryTracing(builder => builder
         options.SetDbStatementForStoredProcedure = true;
         options.SetDbStatementForText = true;
         options.RecordException = true;
-        options.Enrich = (activity, _, _) => activity.SetTag("db.type", "sql");
+        options.Enrich = (activity, x, y) => activity.SetTag("db.type", "sql");
     })
     .AddSource("my-corp.ems.ems-api")
     .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("ems-api"))
@@ -101,23 +101,29 @@ app.MapGet("/ems/billing/{empId}/", async (int empId, SqlConnection db) =>
     .Produces<IEnumerable<Timekeeping>>()
     .Produces(StatusCodes.Status404NotFound);
 
-app.MapPost("/ems/payroll/add/{empId}/{rate}", () =>
+app.MapPost("/ems/payroll/add/", async (Payroll payrollRecord, SqlConnection db) =>
     {
-        using var activity = activitySource.StartActivity("SayHello");
-        activity?.SetTag("foo", 1);
-        activity?.SetTag("bar", "Hello, World!");
-        activity?.SetTag("baz", new[] { 1, 2, 3 });
-    })
-    .WithName("AddEmployeeToPayroll");
+        using var activity = activitySource.StartActivity("Add employee to payroll", ActivityKind.Server);
+        activity?.SetTag(nameof(Timekeeping.EmployeeId), payrollRecord.EmployeeId);
 
-app.MapGet("/ems/payroll/{empId}", () =>
-    {
-        using var activity = activitySource.StartActivity("SayHello");
-        activity?.SetTag("foo", 1);
-        activity?.SetTag("bar", "Hello, World!");
-        activity?.SetTag("baz", new[] { 1, 2, 3 });
+        await db.ExecuteAsync(
+            "INSERT INTO Payroll Values(@EmployeeId, @PayRateInUSD)", payrollRecord);
+        return Results.Created($"/ems/payroll/{payrollRecord.EmployeeId}", payrollRecord);
     })
-    .WithName("GetEmployeePayroll");
+    .WithName("AddEmployeeToPayroll")
+    .Produces(StatusCodes.Status201Created);
+
+app.MapGet("/ems/payroll/{empId}", async (int empId, SqlConnection db) =>
+    {
+        using var activity = activitySource.StartActivity("Fetch payroll data for employee", ActivityKind.Server);
+        activity?.SetTag(nameof(Timekeeping.EmployeeId), empId);
+
+        var result = await db.QueryAsync<Payroll>("SELECT * FROM Payroll WHERE EmployeeId=@empId", empId);
+        return result.Any() ? Results.Ok(result) : Results.NotFound();
+    })
+    .WithName("GetEmployeePayroll")
+    .Produces<IEnumerable<Payroll>>()
+    .Produces(StatusCodes.Status404NotFound);
 
 app.Run();
 
