@@ -87,11 +87,11 @@ app.MapGet("/ems/pay/{empId}", async (int empId, SqlConnection db) =>
 
         // op 1
         var payroll =
-            await db.QuerySingleOrDefaultAsync<Payroll>("SELECT * FROM Payroll WHERE EmployeeId=@EmpId",
+            await db.QuerySingleOrDefaultAsync<Payroll>("SELECT EmployeeId,PayRateInUSD FROM Payroll WHERE EmployeeId=@EmpId",
                 new { EmpId = empId });
 
         // op 2
-        var projects = await db.QueryAsync<Timekeeping>("SELECT * FROM Timekeeping WHERE EmployeeId=@EmpId",
+        var projects = await db.QueryAsync<Timekeeping>("SELECT EmployeeId,ProjectId,WeekClosingDate,HoursWorked FROM Timekeeping WHERE EmployeeId=@EmpId",
             new { EmpId = empId });
 
         var moneyEarned = projects.Sum(p => p.HoursWorked) * payroll.PayRateInUSD;
@@ -132,7 +132,7 @@ app.MapPost("/ems/payroll/remove/{empId}", async (int empId, SqlConnection db) =
             db1.Open();
             payrollRecord =
                 await db1.QuerySingleOrDefaultAsync<Payroll>(
-                    "SELECT * FROM Payroll WHERE EmployeeId=@EmpId", new { EmpId = empId });
+                    "SELECT EmployeeId,PayRateInUSD FROM Payroll WHERE EmployeeId=@EmpId", new { EmpId = empId });
             await db1.CloseAsync();
         }
 
