@@ -80,57 +80,96 @@ app.UseSwaggerUI();
 
 var activitySource = new ActivitySource("my-corp.ems.ems-api");
 
-app.MapPost("/ems/billing", async (Timekeeping timekeepingRecord, SqlConnection db) =>
+app.MapGet("/ems/pay/{empId}", async (int empId, SqlConnection db) =>
     {
-        using var activity = activitySource.StartActivity("Record project work", ActivityKind.Server);
-        activity?.AddEvent(new ActivityEvent("Project billed"));
-        activity?.SetTag(nameof(Timekeeping.EmployeeId), timekeepingRecord.EmployeeId);
-        activity?.SetTag(nameof(Timekeeping.ProjectId), timekeepingRecord.ProjectId);
-        activity?.SetTag(nameof(Timekeeping.WeekClosingDate), timekeepingRecord.WeekClosingDate);
-
-        await db.ExecuteAsync(
-            "INSERT INTO Timekeeping Values(@EmployeeId, @ProjectId, @WeekClosingDate, @HoursWorked)",
-            timekeepingRecord);
-        return Results.Created($"/ems/billing/{timekeepingRecord.EmployeeId}", timekeepingRecord);
-    })
-    .WithName("RecordProjectWork")
-    .Produces(StatusCodes.Status201Created);
-
-app.MapGet("/ems/billing/{empId}/", async (int empId, SqlConnection db) =>
-    {
-        using var activity = activitySource.StartActivity("Fetch projects for employee", ActivityKind.Server);
+        using var activity = activitySource.StartActivity("Chatty db operation", ActivityKind.Server);
         activity?.SetTag(nameof(Timekeeping.EmployeeId), empId);
 
-        var result = await db.QueryAsync<Timekeeping>("SELECT * FROM Timekeeping WHERE EmployeeId=@empId", empId);
-        return result.Any() ? Results.Ok(result) : Results.NotFound();
+        // op 1
+        var payroll =
+            await db.QuerySingleOrDefaultAsync<Payroll>("SELECT * FROM Payroll WHERE EmployeeId=@EmpId",
+                new { EmpId = empId });
+
+        // op 2
+        var projects = await db.QueryAsync<Timekeeping>("SELECT * FROM Timekeeping WHERE EmployeeId=@EmpId",
+            new { EmpId = empId });
+
+        var moneyEarned = projects.Sum(p => p.HoursWorked) * payroll.PayRateInUSD;
+        return Results.Ok(moneyEarned);
     })
-    .WithName("GetBillingDetails")
-    .Produces<IEnumerable<Timekeeping>>()
-    .Produces(StatusCodes.Status404NotFound);
+    .WithName("GetPayment")
+    .Produces(StatusCodes.Status200OK);
 
-app.MapPost("/ems/payroll/add/", async (Payroll payrollRecord, SqlConnection db) =>
+app.MapPost("/ems/billing/pay-raise/", async (SqlConnection db) =>
     {
-        using var activity = activitySource.StartActivity("Add employee to payroll", ActivityKind.Server);
-        activity?.SetTag(nameof(Timekeeping.EmployeeId), payrollRecord.EmployeeId);
-
-        await db.ExecuteAsync(
-            "INSERT INTO Payroll Values(@EmployeeId, @PayRateInUSD)", payrollRecord);
-        return Results.Created($"/ems/payroll/{payrollRecord.EmployeeId}", payrollRecord);
+        using var activity = activitySource.StartActivity("Non optimized query", ActivityKind.Server);
+        var recordsAffected = await db.ExecuteAsync("UPDATE Payroll SET PayRateInUSD = 300 WHERE PayRateInUSD < 300");
+        return Results.Ok(recordsAffected);
     })
-    .WithName("AddEmployeeToPayroll")
-    .Produces(StatusCodes.Status201Created);
+    .WithName("Pay-Raise")
+    .Produces(StatusCodes.Status200OK);
 
-app.MapGet("/ems/payroll/{empId}", async (int empId, SqlConnection db) =>
+app.MapPost("/ems/payroll/remove/{empId}", async (int empId, SqlConnection db) =>
     {
-        using var activity = activitySource.StartActivity("Fetch payroll data for employee", ActivityKind.Server);
+        using var activity = activitySource.StartActivity("Db lock", ActivityKind.Server);
         activity?.SetTag(nameof(Timekeeping.EmployeeId), empId);
 
-        var result = await db.QueryAsync<Payroll>("SELECT * FROM Payroll WHERE EmployeeId=@empId", empId);
-        return result.Any() ? Results.Ok(result) : Results.NotFound();
+        Payroll payrollRecord = new();
+        async Task DeleteRecord()
+        {
+            db.Open();
+            await using var tr = await db.BeginTransactionAsync();
+            await db.ExecuteAsync("DELETE FROM Payroll WHERE EmployeeId=@EmpId", new { EmpId = empId }, tr);
+            Thread.Sleep(5000);
+            await tr.CommitAsync();
+        }
+
+        async Task GetRecord()
+        {
+            await using var db1 =
+                new SqlConnection(builder.Configuration.GetConnectionString("EmployeeDbConnectionString"));
+            Thread.Sleep(100);
+            db1.Open();
+            payrollRecord =
+                await db1.QuerySingleOrDefaultAsync<Payroll>(
+                    "SELECT * FROM Payroll WHERE EmployeeId=@EmpId", new { EmpId = empId });
+            await db1.CloseAsync();
+        }
+
+        await Task.WhenAll(DeleteRecord(), GetRecord());
+
+        return Results.Ok(payrollRecord);
     })
-    .WithName("GetEmployeePayroll")
-    .Produces<IEnumerable<Payroll>>()
-    .Produces(StatusCodes.Status404NotFound);
+    .WithName("RemoveEmployeeFromPayroll")
+    .Produces(StatusCodes.Status200OK);
+
+app.MapPost("/ems/add-employee/{empId}", async (int empId, SqlConnection db) =>
+    {
+        using var activity =
+            activitySource.StartActivity("Multiple ops in a business transaction", ActivityKind.Server);
+        activity?.SetTag(nameof(Timekeeping.EmployeeId), empId);
+
+        //op 1
+        await db.ExecuteAsync("INSERT INTO Payroll Values(@EmployeeId, @PayRateInUSD)",
+            new Payroll { EmployeeId = empId, PayRateInUSD = 100 });
+
+        // Simulate service call by creating another span
+        using var innerActivity = activitySource.StartActivity("Second operation of business transaction", ActivityKind.Server);
+        {
+            // Mock network call delay
+            Thread.Sleep(1000);
+
+            //op 2
+            await db.ExecuteAsync(
+                "INSERT INTO Timekeeping Values(@EmployeeId, @ProjectId, @WeekClosingDate, @HoursWorked)",
+                new Timekeeping
+                    { EmployeeId = empId, HoursWorked = 0, ProjectId = 1, WeekClosingDate = DateTime.Today });
+        }
+
+        return Results.Ok();
+    })
+    .WithName("AddEmployee")
+    .Produces(StatusCodes.Status201Created);
 
 app.Run();
 
